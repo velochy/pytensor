@@ -157,3 +157,28 @@ def test_shared_inner_graph_inlined_twice():
     f = pytensor.function([x], out, mode=FAST)
     xv = rng.normal(size=6)
     np.testing.assert_allclose(f(xv), np.exp(xv)[1:] * 2 + np.exp(xv[::-1])[1:] * 2)
+
+
+def test_dynamic_index_in_fast_path():
+    # q[a] with a runtime action index (Q-learning): read, set and inc at a dynamic position
+    acts, rewards = pt.lvector("acts"), pt.dvector("rewards")
+    q0, lr = pt.tensor("q0", shape=(2,)), pt.dscalar("lr")
+
+    def step(a, r, q, lr):
+        q = pt.set_subtensor(q[a], q[a] + lr * (r - q[a]))
+        return pt.inc_subtensor(q[-1 - a], 0.1 * q[a])
+
+    qs = scan(step, sequences=[acts, rewards], outputs_info=[q0], non_sequences=[lr])
+    vals = [rng.integers(-2, 2, size=30), rng.normal(size=30), np.zeros(2), np.array(0.3)]
+    fast, _ = compare([acts, rewards, q0, lr], [qs], vals)
+    assert "fast path" in scan_steps(fast)[0]
+    with pytest.raises(Exception, match="index out of bounds"):
+        fast(np.array([0, 2]), np.zeros(2), np.zeros(2), np.array(0.3))
+
+
+def test_untraced_state_static_shape():
+    # only the last state is kept -> an untraced state, typed (?,) inside the step
+    x0, eps = pt.tensor("x0", shape=(2,)), pt.tensor("eps", shape=(None, 2))
+    xs = scan(lambda e, x: 0.5 * x[::-1] + e, sequences=[eps], outputs_info=[x0])
+    fast, _ = compare([x0, eps], [xs[-1]], [np.array([1.0, -1.0]), rng.normal(size=(20, 2))])
+    assert "fast path" in scan_steps(fast)[0]

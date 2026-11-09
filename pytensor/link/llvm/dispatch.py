@@ -516,15 +516,43 @@ def _register_fused():
 _register_fused()
 
 
+def _static_untraced_step(op, node):
+    """Step graph with untraced states typed by their static outer shape, if every step keeps it."""
+    ins, outs, nodes = op.fgraph.inputs, op.fgraph.outputs, op.fgraph.toposort()
+    memo = {
+        i: i.type.clone(shape=o.type.shape)(name=i.name)
+        for i, o in zip(op.inner_untraced_sit_sot(ins), op.outer_untraced_sit_sot(node.inputs), strict=True)
+        if isinstance(i.type, TensorType) and i.type.shape != o.type.shape and None not in o.type.shape
+    }
+    if not memo:
+        return ins, nodes, outs
+    new_nodes = []
+    try:
+        for n in nodes:
+            new_in = [memo.get(i, i) for i in n.inputs]
+            nn = n.op.make_node(*new_in) if any(a is not b for a, b in zip(new_in, n.inputs)) else n
+            memo.update(zip(n.outputs, nn.outputs, strict=True))
+            new_nodes.append(nn)
+    except Exception:
+        return ins, nodes, outs
+    new_ins, new_outs = [memo.get(i, i) for i in ins], [memo.get(o, o) for o in outs]
+    kept = all(
+        a.type.shape == b.type.shape
+        for a, b in zip(op.inner_untraced_sit_sot(new_ins), op.inner_untraced_sit_sot_outs(new_outs), strict=True)
+    )
+    return (new_ins, new_nodes, new_outs) if kept else (ins, nodes, outs)
+
+
 @llvm_build.register(Scan)
 def _(op, node, conv, inputs, outputs):
     # the step function becomes its own graph (compiled natively; see scan.rs)
     inner = GraphConversion(numba_fallback=conv.numba_fallback)
-    for i in op.fgraph.inputs:
+    ins, nodes, outs = _static_untraced_step(op, node)
+    for i in ins:
         inner.builder.add_input(inner.var(i))
-    for n in op.fgraph.toposort():
+    for n in nodes:
         inner.convert_node(n)
-    for o in op.fgraph.outputs:
+    for o in outs:
         inner.builder.add_output(inner.var(o))
     info = op.info
     taps = lambda slices: [[int(t) for t in s] for s in slices]  # noqa: E731

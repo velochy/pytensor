@@ -1373,6 +1373,7 @@ impl<'ctx> Cg<'ctx> {
 
         // values (all allocas live in the entry block)
         let mut vp: Vec<PointerValue<'ctx>> = Vec::with_capacity(seg.values.len());
+        let mut dyn_ok = self.ctx.bool_type().const_int(1, false);
         for v in &seg.values {
             let p = match &v.loc {
                 SegLoc::ExtIn(i) => self.gep_bytes(args_p, self.i64c((i * PTARRAY_SIZE) as i64))?,
@@ -1423,6 +1424,18 @@ impl<'ctx> Cg<'ctx> {
                         let (start, step) = match sd {
                             SliceDim::Index(i) => (*i, None),
                             SliceDim::Range { start, step } => (*start, Some(*step)),
+                            SliceDim::Dyn { value, len } => {
+                                let raw = self.load_elem(field(vp[*value], 0)?, seg.values[*value].dtype)?;
+                                let i = self.cast(raw, seg.values[*value].dtype, DType::Int64)?.into_int_value();
+                                let neg = self.b.build_int_compare(IntPredicate::SLT, i, self.i64c(0), "neg").map_err(e)?;
+                                let w = self.b.build_int_nsw_add(i, self.i64c(*len), "w").map_err(e)?;
+                                let i = self.b.build_select(neg, w, i, "i").map_err(e)?.into_int_value();
+                                let inb = self.b.build_int_compare(IntPredicate::ULT, i, self.i64c(*len), "inb").map_err(e)?;
+                                dyn_ok = self.b.build_and(dyn_ok, inb, "dok").map_err(e)?;
+                                let o = self.b.build_int_nsw_mul(s, i, "so").map_err(e)?;
+                                off = self.b.build_int_nsw_add(off, o, "off").map_err(e)?;
+                                (0, None)
+                            }
                         };
                         if start != 0 {
                             let o = self.b.build_int_nsw_mul(s, self.i64c(start), "so").map_err(e)?;
@@ -1464,6 +1477,8 @@ impl<'ctx> Cg<'ctx> {
             self.b.position_at_end(cont);
             Ok(())
         };
+        let oob = self.b.build_not(dyn_ok, "oob").map_err(e)?;
+        fail_with(seg.members.len() + 1, oob)?;
         for (j, m) in seg.members.iter().enumerate() {
             match m {
                 SegMember::Kernel { .. } => {

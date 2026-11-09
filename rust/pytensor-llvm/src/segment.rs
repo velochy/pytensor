@@ -40,6 +40,9 @@ pub enum SliceDim {
     Index(i64),
     /// start and step of a slice; the length is the value's static shape
     Range { start: i64, step: i64 },
+    /// integer index read at runtime from segment value `value` (a node input position until
+    /// `seg_dims` remaps it), bounds-checked against `len`; whole-graph segments only
+    Dyn { value: usize, len: i64 },
 }
 
 /// Scalar integer constants of a graph (var -> value), for static indexing.
@@ -107,14 +110,16 @@ fn resolve_static(g: &Graph, x: usize, entries: &[IndexEntry], inputs: &[usize],
                 dims.push(SliceDim::Range { start: 0, step: 1 });
                 out_lens.push(len);
             }
-            Some(IndexEntry::Int(p)) => {
-                let i = val(*p)?;
-                let i = if i < 0 { i + len } else { i };
-                if i < 0 || i >= len {
-                    return None;
+            Some(IndexEntry::Int(p)) => match val(*p) {
+                Some(i) => {
+                    let i = if i < 0 { i + len } else { i };
+                    if i < 0 || i >= len {
+                        return None;
+                    }
+                    dims.push(SliceDim::Index(i));
                 }
-                dims.push(SliceDim::Index(i));
-            }
+                None => dims.push(SliceDim::Dyn { value: *p, len }),
+            },
             Some(e @ IndexEntry::Slice { .. }) => {
                 let (start, step, count) = slice_len(len, e, inputs, consts)?;
                 dims.push(SliceDim::Range { start, step });
@@ -125,12 +130,25 @@ fn resolve_static(g: &Graph, x: usize, entries: &[IndexEntry], inputs: &[usize],
     (out_lens == out_shape).then_some(dims)
 }
 
+/// `Dyn` indices of a node's slice as segment values (`ins` maps input positions to values).
+fn seg_dims(dims: Vec<SliceDim>, ins: &[usize]) -> Vec<SliceDim> {
+    dims.into_iter().map(|d| match d { SliceDim::Dyn { value, len } => SliceDim::Dyn { value: ins[value], len }, d => d }).collect()
+}
+
+/// Readable when a segment starts: a graph input or constant, or a view of one.
+fn ext_rooted(g: &Graph, v: usize) -> bool {
+    if g.inputs.contains(&v) || g.constants.contains(&v) {
+        return true;
+    }
+    g.nodes.iter().find(|n| n.outputs.contains(&v)).is_some_and(|n| matches!(n.op, Op::DimShuffle { .. }) && ext_rooted(g, n.inputs[0]))
+}
+
 /// Segment location of a node's output if the node is a view (no member needed).
 fn view_loc(g: &Graph, n: &Node, ins: &[usize], o: usize, consts: &ConstInts) -> Option<SegLoc> {
     match &n.op {
         Op::DimShuffle { order } => Some(SegLoc::View { base: ins[0], order: order.clone() }),
         Op::Assert { .. } => Some(SegLoc::View { base: ins[0], order: (0..g.vars[o].ndim()).map(Some).collect() }),
-        Op::Subtensor { .. } => Some(SegLoc::Slice { base: ins[0], dims: static_slice(g, n, consts)? }),
+        Op::Subtensor { .. } => Some(SegLoc::Slice { base: ins[0], dims: seg_dims(static_slice(g, n, consts)?, ins) }),
         _ => None,
     }
 }
@@ -194,19 +212,24 @@ fn is_small(g: &Graph, v: usize, max_elems: i64) -> bool {
 }
 
 /// Can this node be a segment member?
-fn eligible(g: &Graph, n: &Node, max_elems: i64, consts: &ConstInts) -> bool {
+fn eligible(g: &Graph, n: &Node, max_elems: i64, consts: &ConstInts, dyn_ok: bool) -> bool {
     let small = |v: usize| is_small(g, v, max_elems);
     let outs_small = n.outputs.iter().all(|&o| small(o));
+    let slice_ok = |dims: &Vec<SliceDim>| {
+        dims.iter().all(|d| match d { SliceDim::Dyn { value, .. } => dyn_ok && ext_rooted(g, n.inputs[*value]), _ => true })
+    };
     match &n.op {
         // a view: the base can be large (e.g. the joined parameter vector)
-        Op::Subtensor { .. } => outs_small && static_slice(g, n, consts).is_some(),
+        Op::Subtensor { .. } => outs_small && static_slice(g, n, consts).is_some_and(|d| slice_ok(&d)),
         Op::Join { .. } => outs_small && n.inputs.iter().all(|&i| small(i)),
         Op::IncSubtensor { .. } => {
-            outs_small && small(n.inputs[1]) && static_slice(g, n, consts).is_some_and(|_| {
-                // y must broadcast into the region
-                let region = region_shape(g, n.inputs[0], match &n.op { Op::IncSubtensor { entries, .. } => entries, _ => unreachable!() }, &n.inputs, consts).unwrap();
-                let y = static_shape(g, n.inputs[1]).unwrap();
-                y.len() <= region.len() && y.iter().rev().zip(region.iter().rev()).all(|(&a, &b)| a == b || a == 1)
+            outs_small && small(n.inputs[1]) && static_slice(g, n, consts).is_some_and(|d| {
+                slice_ok(&d) && {
+                    // y must broadcast into the region
+                    let region = region_shape(g, n.inputs[0], match &n.op { Op::IncSubtensor { entries, .. } => entries, _ => unreachable!() }, &n.inputs, consts).unwrap();
+                    let y = static_shape(g, n.inputs[1]).unwrap();
+                    y.len() <= region.len() && y.iter().rev().zip(region.iter().rev()).all(|(&a, &b)| a == b || a == 1)
+                }
             })
         }
         // indexed writes update their target in place: not as a member
@@ -271,7 +294,7 @@ fn identity_copy(dt: DType) -> ScalarGraph {
 
 /// Rewrite `g` so runs of small nodes become `Op::Segment` nodes.
 pub fn form_segments(g: Graph, max_elems: i64, fastmath: bool, consts: &ConstInts) -> Graph {
-    let elig: Vec<bool> = g.nodes.iter().map(|n| eligible(&g, n, max_elems, consts)).collect();
+    let elig: Vec<bool> = g.nodes.iter().map(|n| eligible(&g, n, max_elems, consts, false)).collect();
     let order = cluster_order(&g, &elig);
     let graph_outputs: HashSet<usize> = g.outputs.iter().copied().collect();
 
@@ -446,7 +469,7 @@ fn push_member(g: &Graph, n: &Node, ins: &[usize], outs: &[usize], values: &mut 
             let info = &vars[n.outputs[0]];
             let out = outs[0];
             seg_members.push(copy_member(ins[0], out, vars[n.inputs[0]].bcast.clone(), values, info));
-            let dims = static_slice(g, n, consts).expect("eligible");
+            let dims = seg_dims(static_slice(g, n, consts).expect("eligible"), ins);
             let Op::IncSubtensor { entries, .. } = &n.op else { unreachable!() };
             let region = region_shape(g, n.inputs[0], entries, &n.inputs, consts).expect("eligible");
             let rd = region.len();
@@ -567,7 +590,7 @@ pub(crate) fn identity_member(x: usize, y: usize, info: &crate::ir::VarInfo, fas
 /// inputs are the graph inputs followed by its constants; external outputs are the graph
 /// outputs, in order. Used for Scan step functions.
 pub fn whole_graph_segment(g: &Graph, max_elems: i64, fastmath: bool, consts: &ConstInts) -> Option<(SegmentSpec, Vec<String>)> {
-    if !g.nodes.iter().all(|n| eligible(g, n, max_elems, consts)) {
+    if !g.nodes.iter().all(|n| eligible(g, n, max_elems, consts, true)) {
         return None;
     }
     let vars = &g.vars;
