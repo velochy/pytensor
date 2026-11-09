@@ -215,15 +215,118 @@ unsafe fn for_each_lane(shape: &[i64], st_a: &[i64], st_b: &[i64], skip_axis: Op
     }
 }
 
+/// The axis to run as the inner loop: the smallest stride of `st` among dims longer than 1 (ties: the last).
+fn inner_axis(shape: &[i64], st: &[i64]) -> Option<usize> {
+    (0..shape.len()).filter(|&d| shape[d] > 1).min_by_key(|&d| (st[d].unsigned_abs(), std::cmp::Reverse(d))).or(shape.len().checked_sub(1))
+}
+
+/// Call `f(off_a, off_b, n, stride_a, stride_b)` once per inner row of `shape`.
+unsafe fn for_each_row(shape: &[i64], st_a: &[i64], st_b: &[i64], mut f: impl FnMut(isize, isize, usize, isize, isize)) {
+    match inner_axis(shape, st_a) {
+        None => f(0, 0, 1, 0, 0),
+        Some(ax) => for_each_lane(shape, st_a, st_b, Some(ax), |a, b| f(a, b, shape[ax] as usize, st_a[ax] as isize, st_b[ax] as isize)),
+    }
+}
+
+/// Row update `d[i] (+)= s[i]` for n elements with byte strides; contiguous and broadcast (ss == 0) rows vectorize.
+type RowUpdate = unsafe fn(*mut u8, isize, *const u8, isize, usize);
+
+macro_rules! row_fns {
+    ([$($m:meta),*] $name:ident: $t:ty => $op:expr; $($rest:tt)*) => {
+        $(#[$m])* pub unsafe fn $name(d: *mut u8, ds: isize, s: *const u8, ss: isize, n: usize) {
+            let sz = std::mem::size_of::<$t>() as isize;
+            let (d, s) = (d as *mut $t, s as *const $t);
+            if ds == sz && ss == sz {
+                for i in 0..n { *d.add(i) = ($op)(*d.add(i), *s.add(i)); }
+            } else if ds == sz && ss == 0 {
+                let v = *s;
+                for i in 0..n { *d.add(i) = ($op)(*d.add(i), v); }
+            } else {
+                for i in 0..n as isize {
+                    let dp = d.byte_offset(i * ds);
+                    *dp = ($op)(*dp, *s.byte_offset(i * ss));
+                }
+            }
+        }
+        row_fns! { [$($m),*] $($rest)* }
+    };
+    ([$($m:meta),*]) => {};
+}
+macro_rules! row_ops {
+    ($($m:meta),*) => {
+        row_fns! { [$($m),*]
+            row_add_f64: f64 => |a: f64, b: f64| a + b;
+            row_add_f32: f32 => |a: f32, b: f32| a + b;
+            row_add_i64: i64 => |a: i64, b: i64| a.wrapping_add(b);
+            row_add_i32: i32 => |a: i32, b: i32| a.wrapping_add(b);
+            row_add_i16: i16 => |a: i16, b: i16| a.wrapping_add(b);
+            row_add_i8: i8 => |a: i8, b: i8| a.wrapping_add(b);
+            row_add_u8: u8 => |a: u8, b: u8| a.wrapping_add(b);
+            row_or_bool: u8 => |a: u8, b: u8| ((a | b) != 0) as u8;
+            row_set_u64: u64 => |_a: u64, b: u64| b;
+            row_set_u32: u32 => |_a: u32, b: u32| b;
+            row_set_u16: u16 => |_a: u16, b: u16| b;
+            row_set_u8: u8 => |_a: u8, b: u8| b;
+        }
+    };
+}
+mod row_base {
+    row_ops! {}
+}
+// The crate is built for baseline x86-64; `row_updater` picks the AVX2 versions at runtime.
+#[cfg(target_arch = "x86_64")]
+mod row_avx2 {
+    row_ops! { target_feature(enable = "avx2,fma") }
+}
+use row_base::*;
+
+fn row_updater(dt: DType, set: bool) -> RowUpdate {
+    macro_rules! pick {
+        ($m:ident) => {{
+            use $m::*;
+            if set {
+                return match dt.itemsize() { 8 => row_set_u64, 4 => row_set_u32, 2 => row_set_u16, _ => row_set_u8 };
+            }
+            match dt {
+                DType::Float64 => row_add_f64,
+                DType::Float32 => row_add_f32,
+                DType::Int64 => row_add_i64,
+                DType::Int32 => row_add_i32,
+                DType::Int16 => row_add_i16,
+                DType::Int8 => row_add_i8,
+                DType::Uint8 => row_add_u8,
+                DType::Bool => row_or_bool,
+            }
+        }};
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return pick!(row_avx2);
+    }
+    pick!(row_base)
+}
+
+/// Copy `n` elements of `isz` bytes between rows with byte strides.
+unsafe fn row_copy(d: *mut u8, ds: isize, s: *const u8, ss: isize, n: usize, isz: usize) {
+    if ds == isz as isize && ss == isz as isize {
+        std::ptr::copy_nonoverlapping(s, d, n * isz);
+    } else {
+        match isz {
+            8 => row_set_u64(d, ds, s, ss, n),
+            4 => row_set_u32(d, ds, s, ss, n),
+            2 => row_set_u16(d, ds, s, ss, n),
+            _ => for i in 0..n as isize { std::ptr::copy_nonoverlapping(s.offset(i * ss), d.offset(i * ds), isz) },
+        }
+    }
+}
+
 // ------------------------------------------------------------------ copy
 
 /// args = [src, dst(provided)].
 pub unsafe extern "C-unwind" fn ptl_copy(_ctx: *mut PtCtx, args: *mut PtArray, params: *const c_void) -> i32 {
     let isz = p::<CopyParams>(params).itemsize as usize;
     let (s, d) = (arg(args, 0), arg(args, 1));
-    for_each_lane(s.shape(), s.strides(), d.strides(), None, |a, b| {
-        std::ptr::copy_nonoverlapping(s.data.offset(a), d.data.offset(b), isz);
-    });
+    for_each_row(s.shape(), d.strides(), s.strides(), |b, a, n, ds, ss| row_copy(d.data.offset(b), ds, s.data.offset(a), ss, n, isz));
     0
 }
 
@@ -357,9 +460,7 @@ pub unsafe extern "C-unwind" fn ptl_alloc(ctx: *mut PtCtx, args: *mut PtArray, p
         o.data
     };
     let dst_st = o.strides().to_vec();
-    for_each_lane(shape, &src_st[..n], &dst_st, None, |a, b| {
-        std::ptr::copy_nonoverlapping(v.data.offset(a), data.offset(b), isz as usize);
-    });
+    for_each_row(shape, &dst_st, &src_st[..n], |b, a, len, ds, ss| row_copy(data.offset(b), ds, v.data.offset(a), ss, len, isz as usize));
     0
 }
 
@@ -767,55 +868,12 @@ fn n_args_before_out(prm: &SubtensorParams, n_fixed: usize) -> usize {
 }
 
 // typed element updates
-macro_rules! add_fns {
-    ($($name:ident: $t:ty => $op:expr;)*) => {
-        $(unsafe fn $name(d: *mut u8, s: *const u8) {
-            let (a, b) = (*(d as *const $t), *(s as *const $t));
-            *(d as *mut $t) = ($op)(a, b);
-        })*
-    };
-}
-add_fns! {
-    add_f64: f64 => |a: f64, b: f64| a + b;
-    add_f32: f32 => |a: f32, b: f32| a + b;
-    add_i64: i64 => |a: i64, b: i64| a.wrapping_add(b);
-    add_i32: i32 => |a: i32, b: i32| a.wrapping_add(b);
-    add_i16: i16 => |a: i16, b: i16| a.wrapping_add(b);
-    add_i8: i8 => |a: i8, b: i8| a.wrapping_add(b);
-    add_u8: u8 => |a: u8, b: u8| a.wrapping_add(b);
-    or_bool: u8 => |a: u8, b: u8| ((a | b) != 0) as u8;
-}
-
-type Update = unsafe fn(*mut u8, *const u8);
-
-fn updater(dt: DType, set: bool) -> Update {
-    unsafe fn set8(d: *mut u8, s: *const u8) { *(d as *mut u64) = *(s as *const u64) }
-    unsafe fn set4(d: *mut u8, s: *const u8) { *(d as *mut u32) = *(s as *const u32) }
-    unsafe fn set2(d: *mut u8, s: *const u8) { *(d as *mut u16) = *(s as *const u16) }
-    unsafe fn set1(d: *mut u8, s: *const u8) { *d = *s }
-    if set {
-        return match dt.itemsize() { 8 => set8, 4 => set4, 2 => set2, _ => set1 };
-    }
-    match dt {
-        DType::Float64 => add_f64,
-        DType::Float32 => add_f32,
-        DType::Int64 => add_i64,
-        DType::Int32 => add_i32,
-        DType::Int16 => add_i16,
-        DType::Int8 => add_i8,
-        DType::Uint8 => add_u8,
-        DType::Bool => or_bool,
-    }
-}
-
 /// Copy `src` into `dst` (same shape) unless they are the same memory (in place).
 unsafe fn copy_unless_same(src: &PtArray, dst: &PtArray, itemsize: usize) {
     if src.data == dst.data {
         return;
     }
-    for_each_lane(src.shape(), src.strides(), dst.strides(), None, |a, b| {
-        std::ptr::copy_nonoverlapping(src.data.offset(a), dst.data.offset(b), itemsize);
-    });
+    for_each_row(src.shape(), dst.strides(), src.strides(), |b, a, n, ds, ss| row_copy(dst.data.offset(b), ds, src.data.offset(a), ss, n, itemsize));
 }
 
 /// Strides of `y` broadcast (numpy, right-aligned) to `shape`; 0 where y has length 1.
@@ -854,9 +912,9 @@ pub unsafe extern "C-unwind" fn ptl_inc_subtensor(ctx: *mut PtCtx, args: *mut Pt
         Ok(s) => s,
         Err(m) => return PtCtx::fail(ctx, 2, &m),
     };
-    let up = updater(dt, prm.set != 0);
+    let up = row_updater(dt, prm.set != 0);
     let base = out.data.offset(r.offset);
-    for_each_lane(shape, &r.strides[..r.ndim], &yst[..r.ndim], None, |a, b| up(base.offset(a), y.data.offset(b)));
+    for_each_row(shape, &r.strides[..r.ndim], &yst[..r.ndim], |a, b, n, sa, sb| up(base.offset(a), sa, y.data.offset(b), sb, n));
     0
 }
 
@@ -901,6 +959,106 @@ acc_impl! {
     f32 => |a: f32, b: f32| a + b;
     i64 => |a: i64, b: i64| a.wrapping_add(b);
     i32 => |a: i32, b: i32| a.wrapping_add(b);
+}
+
+/// out[idx[j], :r] (+)= y[j, :r], byte strides `os`, `ys` = (row, element).
+#[derive(Clone, Copy)]
+struct RowScatter<'a> {
+    out: *mut u8,
+    os: (isize, isize),
+    len: i64,
+    idx: &'a PtArray,
+    y: *const u8,
+    ys: (isize, isize),
+    r: usize,
+}
+
+#[inline(always)]
+unsafe fn scatter_rows<T: Acc, I: Index, const SET: bool>(a: &RowScatter) -> Result<(), i64> {
+    // locals: stores through `out` could otherwise alias `a` and force reloads
+    let RowScatter { out, os, len, idx, y, ys, r } = *a;
+    let (is, unit) = (idx.strides()[0] as isize, os.1 == ys.1 && os.1 == std::mem::size_of::<T>() as isize);
+    let up = |d: *mut T, v: T| *d = if SET { v } else { T::acc(*d, v) };
+    for j in 0..idx.shape()[0] as isize {
+        let raw = (*(idx.data.offset(j * is) as *const I)).get();
+        let i = if raw < 0 { raw + len } else { raw };
+        if (i as u64) >= len as u64 {
+            return Err(raw);
+        }
+        let (d, s) = (out.offset(i as isize * os.0), y.offset(j * ys.0));
+        if unit {
+            for c in 0..r {
+                up((d as *mut T).add(c), *(s as *const T).add(c));
+            }
+        } else {
+            for c in 0..r as isize {
+                up(d.offset(c * os.1) as *mut T, *(s.offset(c * ys.1) as *const T));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn scatter_rows_avx2<T: Acc, I: Index, const SET: bool>(a: &RowScatter) -> Result<(), i64> {
+    scatter_rows::<T, I, SET>(a)
+}
+
+/// `scatter_rows`, AVX2 version when available.
+unsafe fn scatter_rows_mv<T: Acc, I: Index, const SET: bool>(a: &RowScatter) -> Result<(), i64> {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return scatter_rows_avx2::<T, I, SET>(a);
+    }
+    scatter_rows::<T, I, SET>(a)
+}
+
+/// Indices of a 1-d index array wrapped into [0, len) (numpy negatives); Err(raw) on the first out-of-bounds one.
+unsafe fn wrapped_indices(idx: &PtArray, idt: DType, len: i64) -> Result<Vec<isize>, i64> {
+    let (n, is) = (idx.shape()[0] as usize, idx.strides()[0] as isize);
+    let mut v = Vec::with_capacity(n);
+    for j in 0..n as isize {
+        let raw = read_i64(idx.data.offset(j * is), idt);
+        let i = if raw < 0 { raw + len } else { raw };
+        if i < 0 || i >= len {
+            return Err(raw);
+        }
+        v.push(i as isize);
+    }
+    Ok(v)
+}
+
+/// out[r, j] = x[r, cols[j]] for 2-d x and out (column gather: contiguous row reads instead of strided columns).
+#[inline(always)]
+unsafe fn take_cols<T: Copy>(x: &PtArray, out: &PtArray, cols: &[isize]) {
+    let (xst, ost) = (x.strides(), out.strides());
+    let (xs0, xs1, os0, os1) = (xst[0] as isize, xst[1] as isize, ost[0] as isize, ost[1] as isize);
+    for r in 0..x.shape()[0] as isize {
+        let (xr, or) = (x.data.offset(r * xs0), out.data.offset(r * os0));
+        for (j, &c) in cols.iter().enumerate() {
+            *(or.offset(j as isize * os1) as *mut T) = *(xr.offset(c * xs1) as *const T);
+        }
+    }
+}
+
+/// out[r, cols[j]] (+)= y[r, j] for a 2-d out; y is 2-d (rows may broadcast) or 1-d (broadcast over rows).
+#[inline(always)]
+unsafe fn inc_cols<T: Acc>(out: &PtArray, y: &PtArray, cols: &[isize], set: bool) {
+    let ost = out.strides();
+    let (os0, os1) = (ost[0] as isize, ost[1] as isize);
+    let (ys0, ys1) = match y.ndim {
+        1 => (0, y.strides()[0] as isize),
+        _ => (if y.shape()[0] == 1 { 0 } else { y.strides()[0] as isize }, y.strides()[1] as isize),
+    };
+    for r in 0..out.shape()[0] as isize {
+        let (or, yr) = (out.data.offset(r * os0), y.data.offset(r * ys0));
+        for (j, &c) in cols.iter().enumerate() {
+            let d = or.offset(c * os1) as *mut T;
+            let v = *(yr.offset(j as isize * ys1) as *const T);
+            *d = if set { v } else { T::acc(*d, v) };
+        }
+    }
 }
 
 /// out[idx[j]] (+)= y[j] for 1-d out, idx, y (y stride 0 = broadcast scalar).
@@ -959,6 +1117,15 @@ pub unsafe extern "C-unwind" fn ptl_take(ctx: *mut PtCtx, args: *mut PtArray, pa
             Err(raw) => return oob(raw),
         }
     }
+    // fast path: column gather from a 2-d x
+    if xs.len() == 2 && axis == 1 && k == 1 && (isz == 8 || isz == 4) {
+        let cols = match wrapped_indices(&idx, idt, len) {
+            Ok(c) => c,
+            Err(raw) => return oob(raw),
+        };
+        if isz == 8 { take_cols::<u64>(&x, &out, &cols) } else { take_cols::<u32>(&x, &out, &cols) }
+        return 0;
+    }
     // the sub-array copied per index: x without `axis`, out without the idx dims
     let mut sub_shape = [0i64; MAX_NDIM];
     let mut sx = [0i64; MAX_NDIM];
@@ -995,9 +1162,7 @@ pub unsafe extern "C-unwind" fn ptl_take(ctx: *mut PtCtx, args: *mut PtArray, pa
             std::ptr::copy_nonoverlapping(xb, ob, bytes);
             return;
         }
-        for_each_lane(&sub_shape[..m], &sx[..m], &so[..m], None, |a, b| {
-            std::ptr::copy_nonoverlapping(xb.offset(a), ob.offset(b), isz);
-        });
+        for_each_row(&sub_shape[..m], &so[..m], &sx[..m], |b, a, n, ds, ss| row_copy(ob.offset(b), ds, xb.offset(a), ss, n, isz));
     });
     if let Some(raw) = bad {
         return oob(raw);
@@ -1039,6 +1204,54 @@ pub unsafe extern "C-unwind" fn ptl_inc_take(ctx: *mut PtCtx, args: *mut PtArray
             Err(raw) => return PtCtx::fail(ctx, 2, &format!("index {raw} is out of bounds for axis {axis} with size {len}")),
         }
     }
+    // fast path: out[idx[j], ...] (+)= y[j, ...] (the gradient of a row gather) as one row update per index,
+    // N-d trailing dims merged into one row when C-contiguous
+    let isz = dt.itemsize() as i64;
+    let (yst, ni) = (y.strides(), idx.shape()[0]);
+    let rows = k == 1 && axis == 0 && xs.len() >= 2 && y.ndim as usize == xs.len() && y.shape()[0] == ni && y.shape()[1..] == xs[1..];
+    let row = match rows {
+        true if xs.len() == 2 => Some((xs[1], ost[1], yst[1])),
+        true if is_c_contig(&xs[1..], &ost[1..], isz) && is_c_contig(&xs[1..], &yst[1..], isz) => Some((xs[1..].iter().product(), isz, isz)),
+        _ => None,
+    };
+    if let Some((r, os1, ys1)) = row {
+        let a = RowScatter { out: out.data, os: (ost[0] as isize, os1 as isize), len, idx: &idx, y: y.data, ys: (yst[0] as isize, ys1 as isize), r: r as usize };
+        macro_rules! go {
+            ($t:ty, $i:ty) => {
+                if prm.set != 0 { scatter_rows_mv::<$t, $i, true>(&a) } else { scatter_rows_mv::<$t, $i, false>(&a) }
+            };
+        }
+        let res = match (dt, idt) {
+            (DType::Float64, DType::Int64) => go!(f64, i64),
+            (DType::Float64, DType::Int32) => go!(f64, i32),
+            (DType::Float32, DType::Int64) => go!(f32, i64),
+            (DType::Float32, DType::Int32) => go!(f32, i32),
+            _ => Err(i64::MIN),
+        };
+        match res {
+            Ok(()) => return 0,
+            Err(i64::MIN) => {}
+            Err(raw) => return PtCtx::fail(ctx, 2, &format!("index {raw} is out of bounds for axis {axis} with size {len}")),
+        }
+    }
+    // fast path: column scatter into a 2-d target, y (rows, n) / (1, n) / (n,)
+    if xs.len() == 2 && axis == 1 && k == 1 && matches!(dt, DType::Float64 | DType::Float32) {
+        let n = idx.shape()[0];
+        let y_ok = match y.ndim {
+            1 => y.shape()[0] == n,
+            2 => (y.shape()[0] == xs[0] || y.shape()[0] == 1) && y.shape()[1] == n,
+            _ => false,
+        };
+        if y_ok {
+            let cols = match wrapped_indices(&idx, idt, len) {
+                Ok(c) => c,
+                Err(raw) => return PtCtx::fail(ctx, 2, &format!("index {raw} is out of bounds for axis {axis} with size {len}")),
+            };
+            let set = prm.set != 0;
+            if dt == DType::Float64 { inc_cols::<f64>(&out, &y, &cols, set) } else { inc_cols::<f32>(&out, &y, &cols, set) }
+            return 0;
+        }
+    }
     // y is broadcast against x.shape[:axis] + idx.shape + x.shape[axis+1:]
     let mut full = [0i64; MAX_NDIM];
     let mut nf = 0;
@@ -1073,7 +1286,7 @@ pub unsafe extern "C-unwind" fn ptl_inc_take(ctx: *mut PtCtx, args: *mut PtArray
         sy[m] = if d < axis { yst[d] } else { yst[d + k - 1] };
         m += 1;
     }
-    let up = updater(dt, prm.set != 0);
+    let up = row_updater(dt, prm.set != 0);
     let mut bad: Option<i64> = None;
     for_each_lane(idx.shape(), idx.strides(), &yst[axis..axis + k], None, |io, yo| {
         if bad.is_some() {
@@ -1086,7 +1299,7 @@ pub unsafe extern "C-unwind" fn ptl_inc_take(ctx: *mut PtCtx, args: *mut PtArray
             return;
         }
         let (ob, yb) = (out.data.offset((i * ost[axis]) as isize), y.data.offset(yo));
-        for_each_lane(&sub_shape[..m], &so[..m], &sy[..m], None, |a, b| up(ob.offset(a), yb.offset(b)));
+        for_each_row(&sub_shape[..m], &so[..m], &sy[..m], |a, b, n, sa, sb| up(ob.offset(a), sa, yb.offset(b), sb, n));
     });
     if let Some(raw) = bad {
         return PtCtx::fail(ctx, 2, &format!("index {raw} is out of bounds for axis {axis} with size {len}"));
@@ -1104,9 +1317,7 @@ pub unsafe extern "C-unwind" fn ptl_join(_ctx: *mut PtCtx, args: *mut PtArray, p
     for i in 0..n {
         let x = *arg(args, i);
         let base = out.data.offset((off * ost[axis]) as isize);
-        for_each_lane(x.shape(), x.strides(), ost, None, |a, b| {
-            std::ptr::copy_nonoverlapping(x.data.offset(a), base.offset(b), isz);
-        });
+        for_each_row(x.shape(), ost, x.strides(), |b, a, len, ds, ss| row_copy(base.offset(b), ds, x.data.offset(a), ss, len, isz));
         off += x.shape()[axis];
     }
     0
@@ -1161,9 +1372,7 @@ pub unsafe extern "C-unwind" fn ptl_reshape(ctx: *mut PtCtx, args: *mut PtArray,
     // copy x in C order into the new buffer
     let mut cst = [0i64; MAX_NDIM];
     c_strides(x.shape(), isz, &mut cst[..x.ndim as usize]);
-    for_each_lane(x.shape(), x.strides(), &cst[..x.ndim as usize], None, |a, b| {
-        std::ptr::copy_nonoverlapping(x.data.offset(a), data.offset(b), isz as usize);
-    });
+    for_each_row(x.shape(), &cst[..x.ndim as usize], x.strides(), |b, a, n, ds, ss| row_copy(data.offset(b), ds, x.data.offset(a), ss, n, isz as usize));
     0
 }
 

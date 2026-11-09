@@ -190,3 +190,36 @@ def test_reshape_view_or_copy():
     assert "view reshape" in sched and "native reshape (allocates)" in sched
     with pytest.raises(Exception, match="cannot reshape"):
         f(rng.normal(size=(4, 6)), 5)
+
+
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+def test_column_take_and_scatter(dtype):
+    # last-axis gather/scatter on a 2-d array: native fast path (negatives, duplicates, broadcast rows, bounds)
+    x = pt.matrix("x", dtype=dtype)
+    idx = pt.lvector("idx")
+    yfull, yrow = (pt.matrix("y", dtype=dtype), pt.matrix("yr", dtype=dtype, shape=(1, None)))
+    X = rng.normal(size=(7, 9)).astype(dtype)
+    I = np.array([0, -1, 3, 3, 8, -9])
+    Y, YR = rng.normal(size=(7, 6)).astype(dtype), rng.normal(size=(1, 6)).astype(dtype)
+    rtol = 1e-5 if dtype == "float32" else 1e-12
+    np.testing.assert_allclose(pytensor.function([x, idx], x[:, idx], mode=LLVM)(X, I), X[:, I], rtol=rtol)
+    for y, yv in [(yfull, Y), (yrow, YR)]:
+        expected = X.copy()
+        np.add.at(expected, (slice(None), I), np.broadcast_to(yv, (7, 6)))
+        f = pytensor.function([x, idx, y], pt.inc_subtensor(x[:, idx], y), mode=LLVM)
+        np.testing.assert_allclose(f(X, I, yv), expected, rtol=rtol)
+    with pytest.raises(IndexError):
+        pytensor.function([x, idx], x[:, idx], mode=LLVM)(X, np.array([9]))
+
+
+@pytest.mark.parametrize("set_", [False, True])
+def test_row_scatter_into_3d_target(set_):
+    # N-d targets with contiguous trailing dims take the row scatter path; strided y falls back
+    x, y, i = (pt.tensor("x", shape=(3, 2, 5)), pt.tensor("y", shape=(None, 2, 5)), pt.lvector("i"))
+    upd = (pt.set_subtensor if set_ else pt.inc_subtensor)(x[i], y)
+    I = rng.integers(-3, 3, 40)
+    if set_:
+        I = np.array([0, -1, 1])
+    X, Y = rng.normal(size=(3, 2, 5)), rng.normal(size=(len(I), 2, 10))
+    compare([x, y, i], upd, [X, Y[:, :, :5].copy(), I])
+    compare([x, y, i], upd, [X, Y[:, :, ::2], I])
