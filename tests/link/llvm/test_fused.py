@@ -29,7 +29,8 @@ def compare(inputs, outputs, values):
         res, ref = [res], [ref]
     for r, e in zip(res, ref, strict=True):
         assert r.dtype == e.dtype and r.shape == e.shape, (r.dtype, e.dtype, r.shape, e.shape)
-        np.testing.assert_allclose(r, e, rtol=1e-12)
+        # cancellation leaves near-zero elements: tolerance relative to the array's scale too
+        np.testing.assert_allclose(r, e, rtol=1e-12, atol=1e-12 * np.abs(e).max(initial=0))
     return f
 
 
@@ -149,3 +150,47 @@ def test_multi_index_point_gather_and_scatter():
     ref = pytensor.function([x, w], [out, pytensor.grad(out, x)], mode=REF)(*vals)
     for r, e in zip(f(*vals), ref, strict=True):
         np.testing.assert_allclose(r, e, rtol=1e-12)
+
+
+def test_fused_reads_share_source():
+    # one table read through several index arrays: fused natively, the source repeated as an operand
+    tab = pt.dmatrix("tab")
+    idx = pt.ivector("idx")
+    out = (tab[idx] + tab[idx % 7] + tab[idx % 3]).sum()
+    f = pytensor.function([tab, idx], out, mode=LLVM)
+    sched = f.maker.linker.compiled.info()["schedule"]
+    assert any(s.startswith("FusedElemwise") and "reads=3" in s for s in sched), sched
+    t, i = rng.normal(size=(35, 45)), rng.integers(0, 35, 100).astype("int32")
+    np.testing.assert_allclose(f(t, i), (t[i] + t[i % 7] + t[i % 3]).sum())
+
+
+def test_slice_of_gather_is_fused():
+    # column blocks of one wide gather become narrow gathers absorbed by the fused kernels
+    t = pt.dmatrix("t")
+    i = pt.lvector("i")
+    g = t[i]
+    out = pt.add(*[(g[:, 2 * b : 2 * b + 2] * (b + 1.0)).sum() for b in range(4)])
+    f = pytensor.function([t, i], out, mode=LLVM)
+    assert not any(type(n.op).__name__ == "AdvancedSubtensor" for n in f.maker.fgraph.apply_nodes)
+    T, I = rng.normal(size=(5, 9)), rng.integers(-5, 5, 30)
+    expected = sum((T[I][:, 2 * b : 2 * b + 2] * (b + 1.0)).sum() for b in range(4))
+    np.testing.assert_allclose(f(T, I), expected)
+
+
+def test_shared_gather_fuses_into_each_client():
+    # matrix factorization: U[i], V[j] feed both the prediction and the gradient
+    U, V, y = pt.dmatrix("U"), pt.dmatrix("V"), pt.dvector("y")
+    i, j = pt.lvector("i"), pt.lvector("j")
+    loss = ((y - (U[i] * V[j]).sum(1)) ** 2).sum()
+    f = compare(
+        [U, V, y, i, j],
+        [loss, *pytensor.grad(loss, [U, V])],
+        [
+            rng.normal(size=(7, 3)),
+            rng.normal(size=(5, 3)),
+            rng.normal(size=40),
+            rng.integers(0, 7, 40),
+            rng.integers(0, 5, 40),
+        ],
+    )
+    assert not [d for d in f.maker.linker.compiled.info()["schedule"] if "take" in d]

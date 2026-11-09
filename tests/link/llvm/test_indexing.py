@@ -192,6 +192,30 @@ def test_reshape_view_or_copy():
         f(rng.normal(size=(4, 6)), 5)
 
 
+def test_multi_index_to_flat_rewrite():
+    # x[i, j] on static axes becomes a flat single-array gather/scatter, which the fused kernel absorbs
+    t3 = pt.tensor("t3", shape=(12, 8, 5))
+    i, j, y = pt.ivector("i"), pt.ivector("j"), pt.dmatrix("y")
+    from pytensor.graph.rewriting.db import RewriteDatabaseQuery
+    from pytensor.link.llvm.linker import LLVM_REWRITES
+
+    mode = Mode(LLVMLinker(numba_fallback=False), RewriteDatabaseQuery(include=["fast_run", *LLVM_REWRITES]))
+    f = pytensor.function([t3, i, j], (t3[i, j] * 2.0).sum(), mode=mode)
+    assert any(s.startswith("FusedElemwise") and "reads=1" in s for s in f.maker.linker.compiled.info()["schedule"])
+    T, I, J = (
+        rng.normal(size=(12, 8, 5)),
+        rng.integers(-12, 12, 40).astype("int32"),
+        rng.integers(0, 8, 40).astype("int32"),
+    )
+    np.testing.assert_allclose(f(T, I, J), (T[I, J] * 2.0).sum())
+    g = pytensor.function([t3, i, j, y], pt.inc_subtensor(t3[i, j], y), mode=mode)
+    Y, expected = rng.normal(size=(40, 5)), T.copy()
+    np.add.at(expected, (I, J), Y)
+    np.testing.assert_allclose(g(T, I, J, Y), expected)
+    with pytest.raises(IndexError):
+        f(T, I, (J + 8).astype("int32"))
+
+
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_column_take_and_scatter(dtype):
     # last-axis gather/scatter on a 2-d array: native fast path (negatives, duplicates, broadcast rows, bounds)
@@ -210,6 +234,35 @@ def test_column_take_and_scatter(dtype):
         np.testing.assert_allclose(f(X, I, yv), expected, rtol=rtol)
     with pytest.raises(IndexError):
         pytensor.function([x, idx], x[:, idx], mode=LLVM)(X, np.array([9]))
+
+
+def test_bool_mask_indexing_is_native():
+    # boolean masks become integer indices (bool_idx_to_nonzero) instead of numba fallbacks
+    from pytensor.graph.rewriting.db import RewriteDatabaseQuery
+    from pytensor.link.llvm.linker import LLVM_REWRITES
+
+    mode = Mode(LLVMLinker(numba_fallback=False), RewriteDatabaseQuery(include=["fast_run", *LLVM_REWRITES]))
+    x, y = pt.dvector("x"), pt.dvector("y")
+    mask = np.array([True, False, True, True, False])
+    f = pytensor.function([x, y], [x[mask], pt.set_subtensor(x[mask], y)], mode=mode)
+    X, Y = np.arange(5.0), np.array([-1.0, -2.0, -3.0])
+    taken, written = f(X, Y)
+    np.testing.assert_array_equal(taken, X[mask])
+    expected = X.copy()
+    expected[mask] = Y
+    np.testing.assert_array_equal(written, expected)
+
+
+def test_constant_multi_index_is_static():
+    # constant index arrays on static dims: flat index and bounds check resolved at compile time
+    x, y = pt.tensor("x", shape=(6, 4, 3)), pt.dmatrix("y")
+    I, J = np.array([[0], [-1], [2]]), np.array([1, -4, 3])
+    X, Y = rng.normal(size=(6, 4, 3)), rng.normal(size=(3, 3))
+    f = compare([x, y], [x[I, J] * 2, pt.inc_subtensor(x[I[:, 0], J], y)], [X, Y])
+    assert not [s for s in schedule(f) if "lt" in s or "Reduce{And" in s]
+    g = pytensor.function([x], x[np.array([0, 6]), np.array([0, 1])], mode=LLVM)
+    with pytest.raises(Exception, match="out of bounds"):
+        g(X)
 
 
 @pytest.mark.parametrize("set_", [False, True])

@@ -35,6 +35,7 @@ from pytensor.tensor.basic import (
     get_underlying_scalar_constant_value,
     moveaxis,
     register_infer_shape,
+    stack,
     switch,
 )
 from pytensor.tensor.basic import constant as tensor_constant
@@ -85,7 +86,7 @@ from pytensor.tensor.subtensor import (
     indices_from_subtensor,
     unflatten_index_variables,
 )
-from pytensor.tensor.type import TensorType
+from pytensor.tensor.type import TensorType, integer_dtypes
 from pytensor.tensor.variable import TensorConstant, TensorVariable
 
 
@@ -3004,4 +3005,123 @@ optdb.register(
     "llvm_scalar_adv_index_to_basic",
     dfs_rewriter(llvm_scalar_adv_index_to_basic),
     position=49.9,
+)
+
+
+def flat_multi_index(x, a, index_vars):
+    """``(xr, flat)`` with ``x[..., i, j, ...] == xr[..., flat, ...]``: x with axes ``a:a+k`` merged and the
+    flat index, negatives wrapped and bounds-checked (once, at compile time, for constant indices)."""
+    from pytensor.tensor.math import all as pt_all
+    from pytensor.tensor.math import and_, ge, lt, prod
+
+    dim = lambda d: x.type.shape[d] if x.type.shape[d] is not None else x.shape[d]  # noqa: E731
+    k = len(index_vars)
+    shape = [dim(a + j) for j in range(k)]
+    static = all(isinstance(n, int) for n in shape)
+    flat = ok = None
+    if static and all(isinstance(v, Constant) for v in index_vars):
+        vals = [np.asarray(v.data, dtype="int64") for v in index_vars]
+        vals = [np.where(v < 0, v + n, v) for v, n in zip(vals, shape, strict=True)]
+        if all(((v >= 0) & (v < n)).all() for v, n in zip(vals, shape, strict=True)):
+            for v, n in zip(vals, shape, strict=True):
+                flat = v if flat is None else flat * n + v
+            flat = tensor_constant(flat)
+    if flat is None:
+        for v, n in zip(index_vars, shape, strict=True):
+            v = cast(v, "int64")
+            v = switch(lt(v, 0), v + n, v)
+            ok_i = pt_all(and_(ge(v, 0), lt(v, n)))
+            ok = ok_i if ok is None else and_(ok, ok_i)
+            flat = v if flat is None else flat * n + v
+        flat = Assert("index out of bounds")(flat, ok)
+    size = int(np.prod(shape)) if static else prod(stack(shape))
+    rest = [dim(d) for d in range(a + k, x.type.ndim)]
+    xr = x.reshape([*map(dim, range(a)), size, *rest], ndim=x.type.ndim - k + 1)
+    return xr, flat
+
+
+@node_rewriter([AdvancedSubtensor, AdvancedIncSubtensor])
+def llvm_multi_index_to_flat(fgraph, node):
+    """``x[i, j]`` -> ``flat_multi_index`` gather (likewise inc/set_subtensor) for consecutive 1-d integer
+    index arrays on axes of static length: one index array the FusedElemwise rewrites absorb."""
+    from pytensor.tensor.subtensor import inc_subtensor
+
+    op = node.op
+    is_inc = isinstance(op, AdvancedIncSubtensor)
+    x, *rest = node.inputs
+    y = rest.pop(0) if is_inc else None
+    indices = list(indices_from_subtensor(rest, op.idx_list))
+    indices += [slice(None)] * (x.type.ndim - len(indices))
+    adv = [d for d, e in enumerate(indices) if not isinstance(e, slice)]
+    if len(adv) < 2 or adv != list(range(adv[0], adv[0] + len(adv))):
+        return None
+    arrs = [indices[d] for d in adv]
+    if (
+        any(e != slice(None) for d, e in enumerate(indices) if d not in adv)
+        or any(x.type.shape[d] is None for d in adv)
+        or any(
+            not isinstance(v, TensorVariable)
+            or v.type.ndim != 1
+            or v.type.dtype not in integer_dtypes
+            for v in arrs
+        )
+    ):
+        return None
+    xr, flat = flat_multi_index(x, adv[0], arrs)
+    out = xr[(*(slice(None),) * adv[0], flat)]
+    if is_inc:
+        out = inc_subtensor(
+            out,
+            y,
+            set_instead_of_inc=op.set_instead_of_inc,
+            ignore_duplicates=op.ignore_duplicates,
+        ).reshape(x.shape, ndim=x.type.ndim)
+    if out.type != node.outputs[0].type:
+        out = out.astype(node.outputs[0].type.dtype)
+        if out.type.broadcastable != node.outputs[0].type.broadcastable:
+            return None
+    return [copy_stack_trace(node.outputs[0], out)]
+
+
+@node_rewriter([Subtensor])
+def llvm_slice_of_gather(fgraph, node):
+    """``x[idx][:, a:b]`` -> ``x[:, a:b][idx]``: slice the (small) gathered table instead of the gathered
+    (large) result, for integer vectors on the leading axes of ``x`` and a Subtensor that leaves the
+    gathered axis whole. Column blocks of one wide gather become narrow gathers that the FusedElemwise
+    rewrites absorb as indexed reads, instead of strided reads of a materialized wide array."""
+    g = node.inputs[0]
+    if not (g.owner is not None and isinstance(g.owner.op, AdvancedSubtensor)):
+        return None
+    x, *adv_vars = g.owner.inputs
+    adv = list(indices_from_subtensor(adv_vars, g.owner.op.idx_list))
+    adv += [slice(None)] * (x.type.ndim - len(adv))
+    m = 0
+    while m < len(adv) and isinstance(adv[m], TensorVariable):
+        m += 1
+    if m == 0 or any(e != slice(None) for e in adv[m:]):
+        return None
+    if any(a.type.ndim != 1 or a.type.dtype not in integer_dtypes for a in adv[:m]):
+        return None
+    basic = list(indices_from_subtensor(node.inputs[1:], node.op.idx_list))
+    if not basic or basic[0] != slice(None) or all(b == slice(None) for b in basic[1:]):
+        return None
+    new = x[(slice(None),) * m + tuple(basic[1:])][tuple(adv[:m])]
+    if new.type != node.outputs[0].type:
+        return None
+    copy_stack_trace(node.outputs[0], new)
+    return [new]
+
+
+# After the flat multi-index rewrite (48.5) and before Elemwise fusion (49).
+optdb.register(
+    "llvm_slice_of_gather", dfs_rewriter(llvm_slice_of_gather), position=48.7
+)
+
+
+# Before Elemwise fusion (position 49), so the index arithmetic fuses into one Composite,
+# and before the FusedElemwise rewrites (position 100) that absorb the resulting gather.
+optdb.register(
+    "llvm_multi_index_to_flat",
+    dfs_rewriter(llvm_multi_index_to_flat),
+    position=48.5,
 )

@@ -41,6 +41,7 @@ from pytensor.tensor.subtensor import (
     Subtensor,
 )
 from pytensor.tensor.sort import SortOp
+from pytensor.tensor.rewriting.subtensor import flat_multi_index
 from pytensor.tensor.type import TensorType
 
 
@@ -410,7 +411,7 @@ def _fused_spec(op, node):
     # ordered by output position
     written = sorted(int(s) for e in op.indexed_outputs if e is not None for s in e[0])
     n_elem = len(node.inputs) - n_idx - len(written)
-    if len(E.inputs) != n_elem or len(E.outputs) != len(node.outputs):
+    if len(E.outputs) != len(node.outputs):
         raise NotImplementedError("FusedElemwise: unexpected inner structure")
 
     def check_index(p):
@@ -418,7 +419,10 @@ def _fused_spec(op, node):
         if not isinstance(t, TensorType) or t.ndim != 1 or t.dtype == "bool" or not t.dtype.startswith(("int", "uint")):
             raise NotImplementedError("FusedElemwise: only 1-d integer index arrays are fused")
 
-    reads = [None] * n_elem
+    # Elemwise inputs may share one source array read through several indices, so the kernel gets one
+    # operand per Elemwise input (sources repeated); `src_pos` maps them onto the node's inputs.
+    n_e = len(E.inputs)
+    reads = [None] * n_e
     for k, entry in enumerate(op.indexed_inputs):
         if entry is None:
             continue
@@ -428,15 +432,27 @@ def _fused_spec(op, node):
             if reads[s] is not None:
                 # x[i, j]: one source read through several index arrays
                 raise NotImplementedError("FusedElemwise: multi-index reads are not fused natively")
-            reads[s] = (n_elem + k, int(axis))
-    # inputs must be the inner graph inputs themselves (or indexed reads of them)
+            reads[s] = (n_e + k, int(axis))
+    src_pos = []
     for j, e_in in enumerate(E.inputs):
-        src = inner.inputs[j]
+        o = e_in.owner
         if reads[j] is not None:
-            if not (e_in.owner and isinstance(e_in.owner.op, AdvancedSubtensor) and e_in.owner.inputs[0] is src):
+            if not (o and isinstance(o.op, AdvancedSubtensor) and o.inputs[0] in inner.inputs):
                 raise NotImplementedError("FusedElemwise: unexpected indexed read")
-        elif e_in is not src and not (isinstance(node.inputs[j].type, ScalarType) and all(e_in.type.broadcastable)):
-            raise NotImplementedError("FusedElemwise: transformed Elemwise input")
+            src_pos.append(inner.inputs.index(o.inputs[0]))
+        else:
+            # scalars enter the loop through TensorFromScalar / ExpandDims chains
+            root = e_in
+            while root not in inner.inputs and root.owner and len(root.owner.inputs) == 1:
+                root = root.owner.inputs[0]
+            if root not in inner.inputs or (
+                root is not e_in
+                and not (
+                    isinstance(node.inputs[inner.inputs.index(root)].type, ScalarType) and all(e_in.type.broadcastable)
+                )
+            ):
+                raise NotImplementedError("FusedElemwise: transformed Elemwise input")
+            src_pos.append(inner.inputs.index(root))
 
     outs = [("plain",)] * len(node.outputs)
     for i, spec in enumerate(op.reduced_outputs):
@@ -455,12 +471,13 @@ def _fused_spec(op, node):
         for s in sources:
             if outs[s][0] != "plain":
                 raise NotImplementedError("FusedElemwise: multi-index writes are not fused natively")
-            target = n_elem + n_idx + written.index(int(s))
-            outs[s] = ("write", n_elem + k, int(axis), target, mode == "set")
+            target = n_e + n_idx + written.index(int(s))
+            outs[s] = ("write", n_e + k, int(axis), target, mode == "set")
     for i, o in enumerate(node.outputs):
         if o.type.dtype != E.outputs[i].type.dtype:
             raise NotImplementedError("FusedElemwise: output dtype differs from the loop's")
-    return E, ndim, n_elem, reads, outs
+    operands = [*src_pos, *range(n_elem, len(node.inputs))]
+    return E, ndim, n_e, reads, outs, operands
 
 
 def _register_fused():
@@ -469,13 +486,13 @@ def _register_fused():
     @llvm_build.register(FusedElemwise)
     def _(op, node, conv, inputs, outputs):
         try:
-            E, ndim, n_elem, reads, outs = _fused_spec(op, node)
+            E, ndim, n_e, reads, outs, operands = _fused_spec(op, node)
         except NotImplementedError:
             # still native, just not fused
             return conv.inline(op.fgraph, inputs, outputs)
         types = [ps.get_scalar_type(i.type.dtype) for i in E.inputs]
         sg = scalar_graph(conv.native, E.op.scalar_op, types)
-        conv.builder.fused_elemwise(sg, inputs, outputs, ndim, n_elem, reads, outs)
+        conv.builder.fused_elemwise(sg, [inputs[p] for p in operands], outputs, ndim, n_e, reads, outs)
 
 
 _register_fused()
@@ -625,26 +642,8 @@ def _multi_index(op, index_vars):
     return ints[0], vars_
 
 
-def _flat_index(x, a, index_vars):
-    """Flat index into x reshaped to (shape[:a], prod(shape[a:a+k]), shape[a+k:]),
-    with numpy's negative wrapping and bounds check."""
-    from pytensor.raise_op import Assert
-
-    shape = [x.shape[a + j] for j in range(len(index_vars))]
-    flat = None
-    checks = []
-    for v, n in zip(index_vars, shape, strict=True):
-        v = _pt.cast(v, "int64")
-        v = _pt.switch(_pt.lt(v, 0), v + n, v)
-        checks.append(_pt.all(_pt.and_(_pt.ge(v, 0), _pt.lt(v, n))))
-        flat = v if flat is None else flat * n + v
-    ok = checks[0]
-    for c in checks[1:]:
-        ok = _pt.and_(ok, c)
-    flat = Assert("index out of bounds")(flat, ok)
-    rest = [x.shape[d] for d in range(a + len(index_vars), x.type.ndim)]
-    xr = x.reshape([*[x.shape[d] for d in range(a)], _pt.prod(_pt.stack(shape)), *rest], ndim=a + 1 + len(rest))
-    return xr, flat
+def _dim(x, d):
+    return x.type.shape[d] if x.type.shape[d] is not None else x.shape[d]
 
 
 def _lower_adv_read(conv, node, inputs, outputs, a, index_vars):
@@ -652,11 +651,17 @@ def _lower_adv_read(conv, node, inputs, outputs, a, index_vars):
 
     def build(x, *idx):
         ivars = [idx[p - 1] for p in pos]
-        xr, flat = _flat_index(x, a, ivars)
+        xr, flat = flat_multi_index(x, a, ivars)
         lead = (slice(None),) * a
         taken = xr[(*lead, flat.ravel())]
-        bshape = [flat.shape[d] for d in range(flat.type.ndim)]
-        out_shape = [*[x.shape[d] for d in range(a)], *bshape, *[x.shape[d] for d in range(a + len(ivars), x.type.ndim)]]
+        if flat.type.ndim == 1:
+            return [taken]
+        bshape = [_dim(flat, d) for d in range(flat.type.ndim)]
+        out_shape = [
+            *[_dim(x, d) for d in range(a)],
+            *bshape,
+            *[_dim(x, d) for d in range(a + len(ivars), x.type.ndim)],
+        ]
         return [taken.reshape(out_shape, ndim=node.outputs[0].type.ndim)]
 
     _lower(conv, node, inputs, outputs, build)
@@ -667,18 +672,26 @@ def _lower_adv_inc(conv, node, inputs, outputs, a, index_vars, set_):
 
     def build(x, y, *idx):
         ivars = [idx[p - 2] for p in pos]
-        xr, flat = _flat_index(x, a, ivars)
+        xr, flat = flat_multi_index(x, a, ivars)
         lead = (slice(None),) * a
         target = xr[(*lead, flat.ravel())]
         # y broadcast to the indexed region, then flattened like it
-        region = [*[x.shape[d] for d in range(a)], *[flat.shape[d] for d in range(flat.type.ndim)],
-                  *[x.shape[d] for d in range(a + len(ivars), x.type.ndim)]]
+        region = [
+            *[_dim(x, d) for d in range(a)],
+            *[_dim(flat, d) for d in range(flat.type.ndim)],
+            *[_dim(x, d) for d in range(a + len(ivars), x.type.ndim)],
+        ]
         y = _pt.cast(y, x.type.dtype)
         full = y.type.ndim == len(region) and not any(y.type.broadcastable)
         yb = y if full else _pt.alloc(y, *region)
-        yf = yb.reshape([target.shape[d] for d in range(target.type.ndim)], ndim=target.type.ndim)
+        # 1-d indices leave the region's shape as is: no reshape (a copy, as y's layout is unknown)
+        yf = (
+            yb
+            if flat.type.ndim == 1
+            else yb.reshape([_dim(target, d) for d in range(target.type.ndim)], ndim=target.type.ndim)
+        )
         upd = _pt.set_subtensor(target, yf) if set_ else _pt.inc_subtensor(target, yf)
-        return [upd.reshape(x.shape, ndim=x.type.ndim)]
+        return [upd.reshape([_dim(x, d) for d in range(x.type.ndim)], ndim=x.type.ndim)]
 
     _lower(conv, node, inputs, outputs, build)
 
