@@ -267,7 +267,12 @@ def _(op, node, conv, inputs, outputs):
 
 @llvm_build.register(Dot)
 def _(op, node, conv, inputs, outputs):
-    conv.builder.dot(inputs[0], inputs[1], outputs[0])
+    # the native matmul is float-only and same-dtype: upcast mixed operands like numpy does
+    dtype = node.outputs[0].type.dtype
+    if dtype not in ("float64", "float32"):
+        raise NotImplementedError(f"LLVM backend: Dot with {dtype} output")
+    a, b = (conv.cast(v, dtype) for v in node.inputs)
+    conv.builder.dot(a, b, outputs[0])
 
 
 @llvm_build.register(SortOp)

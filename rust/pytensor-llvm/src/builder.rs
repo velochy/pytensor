@@ -344,11 +344,7 @@ impl GraphBuilder {
         let nd = self.ndim(input);
         self.require(order.len() == self.ndim(output), || "dimshuffle: order length must equal output ndim".into())?;
         self.require(order.len() <= crate::abi::MAX_NDIM, || "too many dims".into())?;
-        for d in 0..nd {
-            if !order.contains(&Some(d)) {
-                self.require(self.graph.vars[input].bcast[d], || format!("dimshuffle: dropped dim {d} is not broadcastable"))?;
-            }
-        }
+        // Dropped dims that are not statically broadcastable are checked to be 1 at runtime by the kernel.
         self.require(order.iter().flatten().all(|&d| d < nd), || "dimshuffle: dim out of range".into())?;
         self.push(Op::DimShuffle { order }, vec![input], vec![output]);
         Ok(())

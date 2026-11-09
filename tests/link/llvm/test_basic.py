@@ -246,3 +246,19 @@ def test_dot_layouts(dtype, m, k):
     for r, e in zip(f(*vals), ref(*vals), strict=True):
         assert r.shape == e.shape
         np.testing.assert_allclose(r, e, rtol=tol, atol=tol)
+
+
+def test_dimshuffle_runtime_drop():
+    # Dropping an axis without static length-1 info is checked at runtime, like the C backend
+    x = pt.dmatrix("x")
+    f = pytensor.function([x], x.dimshuffle(1), mode=LLVM)
+    np.testing.assert_array_equal(f(np.arange(3.0)[None]), np.arange(3.0))
+    with pytest.raises(RuntimeError, match="cannot drop axis 0"):
+        f(np.ones((2, 3)))
+
+
+def test_dot_mixed_dtypes():
+    # int matrix @ float vector upcasts like numpy instead of failing in the native matmul
+    a = pt.lmatrix("a")
+    v = pt.dvector("v")
+    compare([a, v], [pt.dot(a, v), pt.dot(v[:3], a)], [np.arange(12).reshape(3, 4), np.linspace(0, 1, 4)])

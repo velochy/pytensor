@@ -230,12 +230,17 @@ pub unsafe extern "C-unwind" fn ptl_copy(_ctx: *mut PtCtx, args: *mut PtArray, p
 // ------------------------------------------------------------------ views
 
 /// args = [x, out(view of x)].
-pub unsafe extern "C-unwind" fn ptl_dimshuffle(_ctx: *mut PtCtx, args: *mut PtArray, params: *const c_void) -> i32 {
+pub unsafe extern "C-unwind" fn ptl_dimshuffle(ctx: *mut PtCtx, args: *mut PtArray, params: *const c_void) -> i32 {
     let order = &p::<DimShuffleParams>(params).order;
     let x = *arg(args, 0);
     let o = arg(args, 1);
-    o.data = x.data;
     let (xs, xst) = (x.shape(), x.strides());
+    for d in 0..x.ndim as usize {
+        if xs[d] != 1 && !order[..o.ndim as usize].contains(&(d as i64)) {
+            return PtCtx::fail(ctx, 1, &format!("DimShuffle: cannot drop axis {d} with length {} (not 1)", xs[d]));
+        }
+    }
+    o.data = x.data;
     for k in 0..o.ndim as usize {
         let src = order[k];
         let (sh, st) = if src < 0 { (1, 0) } else { (xs[src as usize], xst[src as usize]) };
