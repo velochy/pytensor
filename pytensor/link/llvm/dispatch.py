@@ -568,6 +568,59 @@ def _(op, node, conv, inputs, outputs):
 # ------------------------------------------------------------------ whole graphs
 
 
+def _written_input(node):
+    """Position of the input `node` updates (its output may reuse that buffer), else None."""
+    from pytensor.tensor.rewriting.fused_elemwise import FusedElemwise
+
+    if isinstance(node.op, IncSubtensor | AdvancedIncSubtensor):
+        return 0
+    if isinstance(node.op, FusedElemwise):
+        n_written = sum(len(e[0]) for e in node.op.indexed_outputs if e is not None)
+        return len(node.inputs) - n_written if n_written == 1 else None
+    return None
+
+
+def _writer_last_order(fgraph):
+    """Toposort that runs the other readers of a buffer before the node that updates it, where the
+    dependencies allow: the planner writes in place only into a buffer that dies at the writer, as
+    PyTensor's DestroyHandler orders destroyers after other clients for the C backend."""
+    from pytensor.graph.traversal import toposort_with_orderings
+
+    order = fgraph.toposort()
+    pos = {n: k for k, n in enumerate(order)}
+
+    def depends_on(c, w):  # is w an ancestor of c? (nodes before w in the toposort can't be)
+        stack, seen = [c], set()
+        while stack:
+            n = stack.pop()
+            if n is w:
+                return True
+            for i in n.inputs:
+                o = i.owner
+                if o is not None and o not in seen and pos[o] >= pos[w]:
+                    seen.add(o)
+                    stack.append(o)
+        return False
+
+    orderings: dict = {}
+    writers: dict = {}
+    for n in order:
+        k = _written_input(n)
+        if k is not None and n.inputs[k].owner is not None:
+            writers[n.inputs[k]] = n  # the last writer of each buffer gets it
+    for x, w in writers.items():
+        before = [c for c, _ in fgraph.clients[x] if not isinstance(c, str) and c is not w and not depends_on(c, w)]
+        if before:
+            orderings[w] = before
+    if not orderings:
+        return order
+    try:  # orderings that are each acyclic can still form a cycle together
+        new = list(toposort_with_orderings(fgraph.outputs, blockers=fgraph.inputs, orderings=orderings))
+    except ValueError:
+        return order
+    return new if len(new) == len(order) and set(new) == set(order) else order
+
+
 def fgraph_to_llvm(
     fgraph,
     *,
@@ -588,7 +641,7 @@ def fgraph_to_llvm(
     b = conv.builder
     for i in fgraph.inputs:
         b.add_input(conv.var(i))
-    for node in fgraph.toposort():
+    for node in _writer_last_order(fgraph):
         conv.convert_node(node)
     for o in fgraph.outputs:
         b.add_output(conv.var(o))

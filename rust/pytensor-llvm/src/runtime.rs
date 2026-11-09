@@ -152,6 +152,12 @@ struct Step {
 
 pub struct Program {
     graph: Graph,
+    /// Per step: every output has a fully static shape, so after one call its shapes, strides and
+    /// slot sizes in a CallState never change and need not be recomputed.
+    static_step: Vec<bool>,
+    /// Per step: a view whose output, once warm, is always (input var ptr + recorded offset) with
+    /// unchanged shape/strides; the flag says it also needs the graph inputs' layouts unchanged.
+    fold_view: Vec<Option<(usize, bool)>>,
     storage: Vec<Storage>,
     layout: Vec<Layout>,
     root: Vec<usize>,
@@ -194,6 +200,12 @@ pub struct CallState {
     in_ranges: Vec<(usize, usize)>,
     /// outputs of the last successful call
     pub outs: Vec<OutArray>,
+    /// a call completed: shapes/strides/slot sizes of static steps are in place
+    warm: bool,
+    /// an input's shape or strides differ from the previous call
+    in_changed: bool,
+    /// per step: output offset from the input of a foldable view (see `fold_view`)
+    view_off: Vec<isize>,
 }
 
 // SAFETY: a CallState is used by one thread at a time (&mut for every call); its raw pointers point
@@ -918,7 +930,26 @@ impl Program {
         };
         let in_static = graph.inputs.iter().map(|&v| static_of(v)).collect();
         let out_static = graph.outputs.iter().map(|&v| static_of(v)).collect();
+        let static_step: Vec<bool> = steps.iter().map(|st| graph.nodes[st.node].outputs.iter().all(|&o| static_shape_of(&graph, o).is_some())).collect();
+        let fold_view = steps
+            .iter()
+            .map(|s| {
+                let n = &graph.nodes[s.node];
+                let OutMode::View(i) = modes[s.node] else { return None };
+                let (x, r) = (n.inputs[i], root[n.inputs[i]]);
+                // a view chain of an unchanged input repeats itself; slots and constants need static shapes
+                let from_input = matches!(storage[r], Storage::Input(_));
+                let ok = n.outputs.len() == 1
+                    && n.inputs.iter().enumerate().all(|(j, v)| j == i || graph.constants.contains(v))
+                    && (from_input
+                        || matches!(storage[r], Storage::Slot(_) | Storage::Const(_))
+                            && [n.outputs[0], x, r].iter().all(|&v| static_shape_of(&graph, v).is_some()));
+                ok.then_some((x, from_input))
+            })
+            .collect();
         Ok(Program {
+            static_step,
+            fold_view,
             scans,
             keepalive: Vec::new(),
             in_static,
@@ -1004,6 +1035,9 @@ impl Program {
             direct_written: vec![false; self.graph.outputs.len()],
             in_ranges: vec![(0, 0); self.graph.inputs.len()],
             outs: self.graph.outputs.iter().map(|&v| OutArray::new(self.graph.vars[v].dtype, self.graph.vars[v].ndim())).collect(),
+            warm: false,
+            in_changed: true,
+            view_off: vec![0; self.steps.len()],
         }
     }
 
@@ -1036,6 +1070,7 @@ impl Program {
         let o = self.dim_off[v];
         for d in 0..nd {
             let (s, t) = dim(d);
+            st.in_changed |= st.shapes[o + d] != s || st.strides[o + d] != t;
             st.shapes[o + d] = s;
             st.strides[o + d] = t;
         }
@@ -1344,8 +1379,19 @@ impl Program {
         crate::abi::checked_nbytes(shape, self.graph.vars[v].dtype.itemsize()).ok_or_else(|| crate::abi::bad_size("output", shape))
     }
 
+    fn release_step(&self, st: &mut CallState, step: &Step) {
+        for &v in &step.release {
+            let b = std::mem::replace(&mut st.owners[v], std::ptr::null_mut());
+            if !b.is_null() {
+                // SAFETY: releases the reference owners[v] held; v's last use was this step.
+                unsafe { PtBuffer::decref(b) };
+            }
+        }
+    }
+
     /// Release every owned buffer still held (error path, or leftovers).
     fn release_all(&self, st: &mut CallState) {
+        st.warm = false;
         for v in 0..st.owners.len() {
             let is_const = matches!(self.storage[v], Storage::Const(_));
             if !st.owners[v].is_null() && !is_const {
@@ -1404,15 +1450,25 @@ impl Program {
         }
         let mut args = std::mem::take(&mut st.args);
         for (si, step) in self.steps.iter().enumerate() {
+            if let Some((x, _)) = self.fold_view[si].filter(|&(_, needs_in)| st.warm && !(needs_in && st.in_changed)) {
+                st.ptrs[step.outs[0]] = st.ptrs[x].wrapping_offset(st.view_off[si]);
+                self.release_step(st, step);
+                continue;
+            }
+            let fast = st.warm && self.static_step[si];
             // memory for provided outputs
-            self.infer_shapes(st, step.node)?;
+            if !fast {
+                self.infer_shapes(st, step.node)?;
+            }
             for &o in &step.outs {
                 match self.storage[o] {
                     Storage::Slot(sl) => {
-                        let nb = self.nbytes(st, o)?;
-                        st.slots[sl].ensure(nb);
+                        if !fast {
+                            let nb = self.nbytes(st, o)?;
+                            st.slots[sl].ensure(nb);
+                            self.set_contiguous_strides(st, o);
+                        }
                         st.ptrs[o] = st.slots[sl].ptr;
-                        self.set_contiguous_strides(st, o);
                     }
                     Storage::Fresh if st.prov_var[o].is_some() && {
                         // write straight into caller memory if its strides are the planned ones
@@ -1493,6 +1549,9 @@ impl Program {
                     _ => {}
                 }
             }
+            if let Some((x, _)) = self.fold_view[si] {
+                st.view_off[si] = (st.ptrs[step.outs[0]] as isize).wrapping_sub(st.ptrs[x] as isize);
+            }
             if rc == 0 && checked_mode() {
                 self.check_step(st, step, &args, provided, false)?;
             }
@@ -1513,13 +1572,7 @@ impl Program {
                     (None, None) => format!("kernel {} (node {}) failed with code {rc}", step.desc, step.node),
                 });
             }
-            for &v in &step.release {
-                let b = std::mem::replace(&mut st.owners[v], std::ptr::null_mut());
-                if !b.is_null() {
-                    // SAFETY: releases the reference owners[v] held; v's last use was this step.
-                    unsafe { PtBuffer::decref(b) };
-                }
-            }
+            self.release_step(st, step);
         }
         st.args = args;
 
@@ -1593,6 +1646,8 @@ impl Program {
         }
         debug_assert!(st.owners.iter().all(|p| p.is_null()), "leaked buffer");
         let _ = &self.root;
+        st.warm = true;
+        st.in_changed = false;
         Ok(())
     }
 }

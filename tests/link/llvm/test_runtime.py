@@ -416,3 +416,63 @@ print("ok")
     env = dict(os.environ, PTLLVM_CHECKED="1", PTLLVM_CACHE_DIR=str(tmp_path))
     out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
     assert out.returncode == 0 and "ok" in out.stdout, out.stderr[-2000:]
+
+
+def test_writer_runs_after_other_readers():
+    # base has a reader and an in-place writer; the reader is scheduled first, so the write needs no copy
+    from pytensor.compile.mode import Mode
+    from pytensor.link.llvm.dispatch import _writer_last_order
+    from pytensor.link.llvm.linker import LLVMLinker
+
+    x = pt.dmatrix("x")
+    base = pt.exp(x)
+    out = (pt.set_subtensor(base[:, :2], 0.0) * 3.0).sum() + (base**2).sum()
+    f = pytensor.function([x], out, mode=Mode(linker=LLVMLinker(), optimizer="fast_run"))
+    order = _writer_last_order(f.maker.fgraph)
+    writer = next(n for n in order if type(n.op).__name__ == "IncSubtensor")
+    readers = [c for c, _ in f.maker.fgraph.clients[writer.inputs[0]] if c is not writer]
+    assert all(order.index(r) < order.index(writer) for r in readers)
+    X = np.arange(12.0).reshape(3, 4) / 10
+    E = np.exp(X)
+    expected = (np.where(np.arange(4) < 2, 0.0, E) * 3).sum() + (E**2).sum()
+    np.testing.assert_allclose(f(X), expected)
+
+
+def test_repeated_calls_after_warmup_and_error():
+    # static steps skip shape/stride/slot setup once warm; values must still update, and an error resets it
+    from pytensor.compile.mode import Mode
+    from pytensor.link.llvm.linker import LLVMLinker
+
+    x = pt.tensor("x", shape=(4, 3))
+    i = pt.lscalar("i")
+    out = (pt.exp(x).T @ x)[i % 3].sum() + x[:, 1:].sum()
+    f = pytensor.function([x, i], out, mode=Mode(linker=LLVMLinker(), optimizer="fast_run"))
+    ref = lambda X, k: (np.exp(X).T @ X)[k % 3].sum() + X[:, 1:].sum()  # noqa: E731
+    for k in range(5):
+        X = np.random.default_rng(k).normal(size=(4, 3))
+        np.testing.assert_allclose(f(X, k), ref(X, k))
+    with pytest.raises(Exception):
+        f(np.ones((5, 3)), 0)  # wrong static shape
+    X = np.random.default_rng(9).normal(size=(4, 3))
+    np.testing.assert_allclose(f(X, 2), ref(X, 2))
+
+
+def test_folded_views_follow_input_layout():
+    # warm views become pointer offsets; a change in the inputs' strides must redo them
+    from pytensor.compile.mode import Mode
+    from pytensor.link.llvm.linker import LLVMLinker
+
+    x = pt.tensor("x", shape=(40, 60))  # too big for a segment: views are steps
+    out = pt.exp(x[1:31, ::2].T) + x[0, 1] * x[1:31, 3]
+    f = pytensor.function([x], out, mode=Mode(linker=LLVMLinker(), optimizer="fast_run"))
+    ref = lambda X: np.exp(X[1:31, ::2].T) + X[0, 1] * X[1:31, 3]  # noqa: E731
+    assert any(d.startswith("view") for d in compiled(f).info()["schedule"])
+    big = np.random.default_rng(0).normal(size=(80, 120))
+    for X in [
+        big[:40, :60].copy(),
+        big[:40, :60] + 1,
+        big[::2, ::2],
+        big[1::2, 1::2],
+        np.asfortranarray(big[:40, :60]),
+    ]:
+        np.testing.assert_allclose(compiled(f)(X)[0], ref(X))
