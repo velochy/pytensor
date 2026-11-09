@@ -1086,7 +1086,10 @@ impl<'ctx> Cg<'ctx> {
                     st.push(v);
                 }
                 let zero = self.i64c(0);
-                self.gen_nest(0, &order, &shape, &st, vec![zero; n_ops], &mut |offs| {
+                let unit: Vec<i64> = (0..n_ops).map(|j| if j < ni { inputs[j].dtype } else { outputs[own_out[j - ni]] }.itemsize() as i64).collect();
+                // output dims of static length 1 get no loop
+                let real: Vec<usize> = order.iter().copied().filter(|&d| !out_bcast[d]).collect();
+                self.gen_nest(0, &real, &shape, &st, vec![zero; n_ops], &unit, &mut |offs| {
                     let mut ins = Vec::with_capacity(ni);
                     for j in 0..ni {
                         ins.push(match scal[j] {
@@ -1108,7 +1111,9 @@ impl<'ctx> Cg<'ctx> {
         })
     }
 
-    /// Nested loops over `shape[d..]`, carrying per-operand byte offsets.
+    /// Nested loops over `shape[d..]`, carrying per-operand byte offsets. With `unit`
+    /// (per-operand itemsizes), the innermost loop also gets a unit-stride version, which LLVM vectorizes.
+    #[allow(clippy::too_many_arguments)]
     fn gen_nest(
         &self,
         pos: usize,
@@ -1116,22 +1121,48 @@ impl<'ctx> Cg<'ctx> {
         shape: &[IntValue<'ctx>],
         st: &[Vec<Option<IntValue<'ctx>>>],
         offs: Vec<IntValue<'ctx>>,
+        unit: &[i64],
         body: &mut dyn FnMut(&[IntValue<'ctx>]) -> R<()>,
     ) -> R<()> {
         if pos == order.len() {
             return body(&offs);
         }
         let d = order[pos];
-        self.emit_loop(shape[d], &mut |i| {
-            let mut new = offs.clone();
-            for j in 0..offs.len() {
-                if let Some(s) = st[j][d] {
-                    let m = self.b.build_int_nsw_mul(i, s, "m").map_err(e)?;
-                    new[j] = self.b.build_int_nsw_add(offs[j], m, "o").map_err(e)?;
+        let step = |strides: &[Option<IntValue<'ctx>>], body: &mut dyn FnMut(&[IntValue<'ctx>]) -> R<()>| {
+            self.emit_loop(shape[d], &mut |i| {
+                let mut new = offs.clone();
+                for j in 0..offs.len() {
+                    if let Some(s) = strides[j] {
+                        let m = self.b.build_int_nsw_mul(i, s, "m").map_err(e)?;
+                        new[j] = self.b.build_int_nsw_add(offs[j], m, "o").map_err(e)?;
+                    }
                 }
+                self.gen_nest(pos + 1, order, shape, st, new, unit, body)
+            })
+        };
+        let inner: Vec<Option<IntValue>> = st.iter().map(|v| v[d]).collect();
+        if pos + 1 < order.len() || unit.is_empty() || inner.iter().all(|s| s.is_none()) {
+            return step(&inner, body);
+        }
+        let mut ok = self.ctx.bool_type().const_int(1, false);
+        for (j, s) in inner.iter().enumerate() {
+            if let Some(s) = s {
+                let eq = self.b.build_int_compare(IntPredicate::EQ, *s, self.i64c(unit[j]), "u").map_err(e)?;
+                ok = self.b.build_and(ok, eq, "uok").map_err(e)?;
             }
-            self.gen_nest(pos + 1, order, shape, st, new, body)
-        })
+        }
+        let f = self.cur_fn();
+        let (ub, sb, jb) = (self.ctx.append_basic_block(f, "unit"), self.ctx.append_basic_block(f, "strd"), self.ctx.append_basic_block(f, "join"));
+        self.b.build_conditional_branch(ok, ub, sb).map_err(e)?;
+        self.b.position_at_end(ub);
+        let consts: Vec<Option<IntValue>> = inner.iter().enumerate().map(|(j, s)| s.map(|_| self.i64c(unit[j]))).collect();
+        step(&consts, body)?;
+        self.b.build_unconditional_branch(jb).map_err(e)?;
+        self.b.position_at_end(sb);
+        step(&inner, body)?;
+        self.b.build_unconditional_branch(jb).map_err(e)?;
+        self.b.position_at_end(jb);
+        Ok(())
     }
 
     // ---------------------------------------------------------------- reduce
@@ -1567,7 +1598,7 @@ impl<'ctx> Cg<'ctx> {
                             .collect::<R<_>>()?;
                         let order: Vec<usize> = (0..ndim).collect();
                         let z = self.i64c(0);
-                        self.gen_nest(0, &order, &tdims, &st, vec![z, z], &mut |offs| {
+                        self.gen_nest(0, &order, &tdims, &st, vec![z, z], &[], &mut |offs| {
                             let v = self.load_elem(self.gep_bytes(data[t], offs[0])?, odt)?;
                             self.store_elem(self.gep_bytes(data[a], offs[1])?, v, odt)
                         })?;
@@ -1643,7 +1674,8 @@ impl<'ctx> Cg<'ctx> {
                     }
                 }
             }
-            let order: Vec<usize> = (0..ndim).collect();
+            // dims of static length 1 get no loop, so the innermost loop is a real one
+            let order: Vec<usize> = (0..ndim).filter(|&d| dim_src[d].is_some()).collect();
             let zero = self.i64c(0);
             let mut step = |d: usize, i: IntValue<'ctx>, offs: &[IntValue<'ctx>]| -> R<Vec<IntValue<'ctx>>> {
                 let mut loaded: Vec<(usize, IntValue)> = Vec::new();
@@ -1719,11 +1751,11 @@ impl<'ctx> Cg<'ctx> {
                 }
                 Ok(new_accs)
             };
-            if ndim == 0 {
+            if order.is_empty() {
                 let ptrs: Vec<PointerValue> = ops.iter().map(|&a| self.gep_bytes(data[a], zero)).collect::<R<_>>()?;
                 compute(&ptrs, &vec![None; outs.len()], &[])?;
             } else {
-                let inner_dim = order[ndim - 1];
+                let inner_dim = order[order.len() - 1];
                 // Innermost loop: register accumulators for reductions along it, and two
                 // versions -- unit element strides (typed GEPs, vectorizes) or byte strides.
                 let mut inner = |offs: &[IntValue<'ctx>]| -> R<()> {
@@ -1878,7 +1910,7 @@ impl<'ctx> Cg<'ctx> {
                     }
                     Ok(())
                 };
-                self.nest_custom(0, &order[..ndim - 1], &dims, vec![zero; ops.len()], &mut step, &mut inner)?;
+                self.nest_custom(0, &order[..order.len() - 1], &dims, vec![zero; ops.len()], &mut step, &mut inner)?;
             }
             // the scaffold returns 0 from the current block; the failure block returns 1
             let cur = self.b.get_insert_block().unwrap();

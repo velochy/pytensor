@@ -262,3 +262,40 @@ def test_dot_mixed_dtypes():
     a = pt.lmatrix("a")
     v = pt.dvector("v")
     compare([a, v], [pt.dot(a, v), pt.dot(v[:3], a)], [np.arange(12).reshape(3, 4), np.linspace(0, 1, 4)])
+
+
+def test_permuted_constants():
+    # F-ordered / permuted constants are registered as views of one C buffer
+    A = rng.normal(size=(5, 4))
+    B = np.ascontiguousarray(rng.normal(size=(2, 3, 4)).transpose(2, 0, 1))[::1]
+    x, y = pt.dvector("x"), pt.dvector("y")
+    compare(
+        [x, y],
+        [pt.dot(pt.constant(A), x) + 1, pt.dot(pt.constant(A.T), y), pt.constant(B.transpose(1, 2, 0)) * x[0]],
+        [rng.normal(size=4), rng.normal(size=5)],
+    )
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_broadcast_elemwise_inner_strides(transpose):
+    # generic (broadcasting) path: unit-stride inner loop and strided fallback
+    a, r = pt.dmatrix("a"), pt.dvector("r")
+    d = pt.dot(a, a.T)
+    d = d[:, ::2].T if transpose else d
+    out = pt.exp(-pt.sqrt(pt.clip(r[: d.shape[0], None] + r[None, : d.shape[1]] - 2 * d, 0, np.inf) + 1e-12))
+    compare([a, r], [out, out * d], [rng.normal(size=(6, 3)), rng.uniform(1, 2, size=6)])
+
+
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+def test_small_matmul_layouts(dtype):
+    # small products skip faer: row-vector @ matrix, F-ordered matrix @ vector, strided operands
+    a, b = pt.matrix("a", dtype=dtype), pt.matrix("b", dtype=dtype)
+    v = pt.vector("v", dtype=dtype)
+    A, B = (rng.normal(size=(9, 70)).astype(dtype), rng.normal(size=(70, 3)).astype(dtype))
+    tol = dict(rtol=1e-4, atol=1e-4) if dtype == "float32" else {}
+    compare(
+        [a, b, v],
+        [a[:1] @ b, a.T @ v[:9], pt.dot(v[:70], b), a[:, ::2] @ b[::2]],
+        [A, B, rng.normal(size=70).astype(dtype)],
+        **tol,
+    )

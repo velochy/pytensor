@@ -615,6 +615,41 @@ unsafe fn gemv_short_rows<T: Real>(m: usize, k: usize, a: *const T, rsa: isize, 
 /// Rows up to this length go through `gemv_short_rows`; longer ones through faer.
 const SHORT_ROW: usize = 64;
 
+/// Products up to this many multiply-adds skip faer's setup (`small_matmul`).
+const SMALL_MATMUL: usize = 1 << 16;
+
+/// C = A B by plain loops, ordered so the inner loop runs along a unit-stride operand: rows of
+/// B (and C), or for a matrix-vector product the columns of a column-major A.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn small_matmul<T: Real>(m: usize, n: usize, k: usize, a: *const T, (rsa, csa): (isize, isize), b: *const T, (rsb, csb): (isize, isize), c: *mut T, (rsc, csc): (isize, isize)) {
+    let at = |i: usize, j: usize, p: *const T, rs: isize, cs: isize| p.offset(i as isize * rs + j as isize * cs);
+    for i in 0..m {
+        for j in 0..n {
+            *(at(i, j, c, rsc, csc) as *mut T) = T::default();
+        }
+    }
+    if n == 1 {
+        for p in 0..k {
+            let x = *at(p, 0, b, rsb, csb);
+            for i in 0..m {
+                let cp = at(i, 0, c, rsc, csc) as *mut T;
+                *cp = (*cp).madd::<false>(*at(i, p, a, rsa, csa), x);
+            }
+        }
+    } else {
+        for i in 0..m {
+            for p in 0..k {
+                let x = *at(i, p, a, rsa, csa);
+                for j in 0..n {
+                    let cp = at(i, j, c, rsc, csc) as *mut T;
+                    *cp = (*cp).madd::<false>(x, *at(p, j, b, rsb, csb));
+                }
+            }
+        }
+    }
+}
+
 macro_rules! matmul_kernel {
     ($name:ident, $t:ty) => {
         /// args = [a, b, out(provided)]; 1-d/2-d operands (numpy dot semantics).
@@ -649,6 +684,10 @@ macro_rules! matmul_kernel {
                     tmp as *const $t
                 };
                 gemv_short_rows(gm, gk, ga, grs, x, c.data as *mut $t, gincy);
+                return 0;
+            }
+            if m * n * k <= SMALL_MATMUL && (if n == 1 { rsa == 1 || m == 1 } else { csb == 1 }) {
+                small_matmul::<$t>(m, n, k, a.data as *const $t, (rsa, csa), b.data as *const $t, (rsb, csb), c.data as *mut $t, (rsc, csc));
                 return 0;
             }
             let lhs = faer::MatRef::<$t>::from_raw_parts(a.data as *const $t, m, k, rsa, csa);

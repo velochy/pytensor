@@ -68,6 +68,7 @@ class GraphConversion:
         self.native = _native()
         self.builder = self.native.GraphBuilder()
         self.ids: dict[Variable, int] = {}
+        self.consts: dict[tuple, tuple[int, np.ndarray]] = {}
         self.numba_fallback = numba_fallback
 
     def convert_node(self, node):
@@ -128,11 +129,28 @@ class GraphConversion:
         if t.dtype not in SUPPORTED_DTYPES:
             raise NotImplementedError(f"LLVM backend: dtype {t.dtype} is not supported")
         if isinstance(v, Constant):
-            i = self.builder.constant(np.asarray(v.data, dtype=t.dtype), bcast)
+            i = self.constant(np.asarray(v.data, dtype=t.dtype), bcast, shape)
         else:
             i = self.builder.variable(t.dtype, bcast, shape)
         self.ids[v] = i
         return i
+
+    def constant(self, data: np.ndarray, bcast, shape) -> int:
+        """Builder id of a constant; buffers are shared, and permuted contiguous data stays a view."""
+        perm = None
+        if data.ndim > 1 and not data.flags.c_contiguous and min(data.strides) > 0:
+            p = tuple(int(i) for i in np.argsort([-s for s in data.strides], kind="stable"))
+            if data.transpose(p).flags.c_contiguous:
+                data, perm = data.transpose(p), p
+        key = (data.__array_interface__["data"][0], data.shape, data.strides, data.dtype.str)
+        if key not in self.consts:  # holding `data` keeps its address from being reused
+            self.consts[key] = (self.builder.constant(data, [bcast[i] for i in perm] if perm else bcast), data)
+        i = self.consts[key][0]
+        if perm is None:
+            return i
+        out = self.builder.variable(data.dtype.name, bcast, shape)
+        self.builder.dimshuffle(np.argsort(perm).tolist(), i, out)
+        return out
 
     def cast(self, v: Variable, dtype: str) -> int:
         """Builder id of `v` converted to `dtype` (adds a cast Elemwise if needed)."""

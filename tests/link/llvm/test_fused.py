@@ -194,3 +194,10 @@ def test_shared_gather_fuses_into_each_client():
         ],
     )
     assert not [d for d in f.maker.linker.compiled.info()["schedule"] if "take" in d]
+
+
+def test_static_unit_dims_get_no_loop():
+    # (n, 1) reductions and (n, k, 1) broadcasts: the length-1 dims are skipped, results unchanged
+    z, a, b = (pt.dvector("z"), pt.tensor("a", shape=(None, 5, 1)), pt.tensor("b", shape=(None, 1, 1)))
+    outs = [(pt.sqr(z[:, None]) * 0.5).sum(), a * 2 + b, (a * b).sum(axis=(0, 2))]
+    compare([z, a, b], outs, [rng.normal(size=300), rng.normal(size=(40, 5, 1)), rng.normal(size=(40, 1, 1))])
