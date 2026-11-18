@@ -1780,6 +1780,19 @@ def test_inplace_multi_output_skips_cyclic_pairs():
     assert not node.op.destroy_map
 
 
+def test_inplace_scalar_outputs_in_large_graph():
+    # Scalar outputs go in place regardless of graph size (#2684)
+    x, y = pt.dscalars("x", "y")
+    out = pt.exp(x + y)
+    padding = [pt.specify_shape(pt.vector(f"v{i}"), (4,)) for i in range(600)]
+    fgraph = FunctionGraph(
+        [x, y, *(p.owner.inputs[0] for p in padding)], [out, *padding]
+    )
+    add_supervisor_to_fgraph(fgraph, [In(i) for i in fgraph.inputs])
+    rewrite_graph(fgraph, include=("inplace",))
+    assert fgraph.outputs[0].owner.op.destroy_map == {0: [0]}
+
+
 def test_InplaceElemwiseOptimizer_bug():
     # Regression test for https://github.com/pymc-devs/pytensor/issues/1420
 
